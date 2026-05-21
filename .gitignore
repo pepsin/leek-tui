@@ -1,0 +1,18 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+build/
+
+# Epub files
+*.epub
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
