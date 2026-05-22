@@ -7,26 +7,24 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Test save
-    const items = &[_]pf.Item{
-        .{ .market = "sh", .code = "600519", .name = "贵州茅台" },
-        .{ .market = "sz", .code = "000001", .name = "平安银行" },
+    var portfolio = try allocator.alloc(pf.Item, 2);
+    portfolio[0] = .{ .market = "sh", .code = "600519", .name = "贵州茅台" };
+    portfolio[1] = .{ .market = "sz", .code = "000001", .name = "平安银行" };
+
+    const config = pf.Config{
+        .portfolio = portfolio,
+        .refresh_interval = 10,
     };
-    try pf.save(allocator, items);
-    std.debug.print("保存 portfolio 成功\n", .{});
+    try pf.save(allocator, config);
+    allocator.free(portfolio);
+    std.debug.print("保存 config 成功\n", .{});
 
     // Test load
-    const loaded = try pf.load(allocator);
-    defer {
-        for (loaded) |item| {
-            allocator.free(item.market);
-            allocator.free(item.code);
-            allocator.free(item.name);
-        }
-        allocator.free(loaded);
-    }
+    var loaded = try pf.load(allocator);
+    defer loaded.deinit(allocator);
 
-    std.debug.print("加载 portfolio: {d} 条\n", .{loaded.len});
-    for (loaded) |item| {
+    std.debug.print("加载 config: portfolio={d} 条, refresh_interval={d}\n", .{ loaded.portfolio.len, loaded.refresh_interval });
+    for (loaded.portfolio) |item| {
         std.debug.print("  {s} | {s} | {s}\n", .{ item.name, item.code, item.market });
     }
 }

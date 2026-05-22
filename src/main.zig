@@ -124,16 +124,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Load portfolio
-    var portfolio_items = try pf.load(allocator);
-    defer {
-        for (portfolio_items) |item| {
-            allocator.free(item.market);
-            allocator.free(item.code);
-            allocator.free(item.name);
-        }
-        allocator.free(portfolio_items);
-    }
+    // Load config
+    var config = try pf.load(allocator);
+    defer config.deinit(allocator);
 
     // Init TUI
     try tui.init();
@@ -142,7 +135,7 @@ pub fn main() !void {
     var state = tui.AppState{
         .mode = .normal,
         .quotes = &.{},
-        .portfolio = portfolio_items,
+        .portfolio = config.portfolio,
         .selected = 0,
         .search_query = "",
         .search_results = &.{},
@@ -201,7 +194,7 @@ pub fn main() !void {
                         search_dirty = false;
                     },
                     .select => {
-                        try addSelected(&state, allocator, &portfolio_items);
+                        try addSelected(&state, allocator, &config.portfolio);
                         state.mode = .normal;
                         freeSearchResults(state.search_results, allocator);
                         state.search_results = &.{};
@@ -242,12 +235,12 @@ pub fn main() !void {
                 },
                 .confirm_delete => switch (event) {
                     .select => {
-                        try deleteSelected(&state, allocator, &portfolio_items);
+                        try deleteSelected(&state, allocator, &config.portfolio);
                         state.mode = .normal;
                     },
                     .char => |c| {
                         if (c == 'y' or c == 'Y') {
-                            try deleteSelected(&state, allocator, &portfolio_items);
+                            try deleteSelected(&state, allocator, &config.portfolio);
                         }
                         state.mode = .normal;
                     },
@@ -269,7 +262,7 @@ pub fn main() !void {
 
         // Periodic refresh
         const now = std.time.timestamp();
-        if (now - last_refresh >= 5) {
+        if (now - last_refresh >= config.refresh_interval) {
             try refreshQuotes(&state, allocator);
             last_refresh = now;
         }
@@ -278,6 +271,6 @@ pub fn main() !void {
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
-    // Save portfolio on exit
-    try pf.save(allocator, portfolio_items);
+    // Save config on exit
+    try pf.save(allocator, config);
 }
