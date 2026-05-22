@@ -217,9 +217,12 @@ pub fn main() !void {
                     },
                     .backspace => {
                         if (state.search_query.len > 0) {
-                            const new_len = std.unicode.utf8ByteSequenceLength(state.search_query[state.search_query.len - 1]) catch 1;
-                            const new_query = try allocator.alloc(u8, state.search_query.len - new_len);
-                            @memcpy(new_query, state.search_query[0..state.search_query.len - new_len]);
+                            var idx = state.search_query.len - 1;
+                            while (idx > 0 and (state.search_query[idx] & 0xC0) == 0x80) {
+                                idx -= 1;
+                            }
+                            const new_query = try allocator.alloc(u8, idx);
+                            @memcpy(new_query, state.search_query[0..idx]);
                             allocator.free(state.search_query);
                             state.search_query = new_query;
                             search_dirty = true;
