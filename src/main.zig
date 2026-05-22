@@ -23,32 +23,47 @@ fn freeSearchResults(results: []const api.SearchResult, allocator: std.mem.Alloc
     allocator.free(results);
 }
 
+fn setMessage(state: *tui.AppState, allocator: std.mem.Allocator, msg: []const u8) void {
+    allocator.free(state.message);
+    state.message = msg;
+}
+
 fn refreshQuotes(state: *tui.AppState, allocator: std.mem.Allocator) !void {
     if (state.portfolio.len == 0) {
-        state.quotes = &.{};
+        freeQuotes(state.quotes, allocator);
+        state.quotes = try allocator.alloc(api.Quote, 0);
         state.last_update = std.time.timestamp();
         return;
     }
 
     const new_quotes = api.fetchQuotes(allocator, state.portfolio) catch |e| {
-        state.message = try std.fmt.allocPrint(allocator, "刷新失败: {s}", .{@errorName(e)});
+        const msg = std.fmt.allocPrint(allocator, "刷新失败: {s}", .{@errorName(e)}) catch return;
+        setMessage(state, allocator, msg);
         return;
     };
 
-    freeQuotes(state.quotes, allocator);
-    state.quotes = new_quotes;
-    state.last_update = std.time.timestamp();
+    // Only replace if we got valid data; keep old quotes otherwise
+    if (new_quotes.len > 0) {
+        freeQuotes(state.quotes, allocator);
+        state.quotes = new_quotes;
+        state.last_update = std.time.timestamp();
+    } else {
+        // Got empty result but no error — free it and keep old data
+        allocator.free(new_quotes);
+        state.last_update = std.time.timestamp();
+    }
 }
 
 fn performSearch(state: *tui.AppState, allocator: std.mem.Allocator) !void {
     if (state.search_query.len == 0) {
         freeSearchResults(state.search_results, allocator);
-        state.search_results = &.{};
+        state.search_results = try allocator.alloc(api.SearchResult, 0);
         return;
     }
 
     const results = api.search(allocator, state.search_query) catch |e| {
-        state.message = try std.fmt.allocPrint(allocator, "搜索失败: {s}", .{@errorName(e)});
+        const msg = std.fmt.allocPrint(allocator, "搜索失败: {s}", .{@errorName(e)}) catch return;
+        setMessage(state, allocator, msg);
         return;
     };
 
@@ -59,14 +74,15 @@ fn performSearch(state: *tui.AppState, allocator: std.mem.Allocator) !void {
     }
 }
 
-fn addSelected(state: *tui.AppState, allocator: std.mem.Allocator, portfolio_items: *[]pf.Item) !void {
+fn addSelected(state: *tui.AppState, allocator: std.mem.Allocator, config: *pf.Config) !void {
     if (state.search_results.len == 0) return;
     const sel = state.search_results[state.search_selected];
 
     // Check duplicate
     for (state.portfolio) |item| {
         if (std.mem.eql(u8, item.code, sel.code) and std.mem.eql(u8, item.market, sel.market)) {
-            state.message = try std.fmt.allocPrint(allocator, "已存在: {s}", .{sel.name});
+            const msg = try std.fmt.allocPrint(allocator, "已存在: {s}", .{sel.name});
+            setMessage(state, allocator, msg);
             return;
         }
     }
@@ -76,19 +92,28 @@ fn addSelected(state: *tui.AppState, allocator: std.mem.Allocator, portfolio_ite
         .code = try allocator.dupe(u8, sel.code),
         .name = try allocator.dupe(u8, sel.name),
     };
+    errdefer {
+        allocator.free(new_item.market);
+        allocator.free(new_item.code);
+        allocator.free(new_item.name);
+    }
 
-    const new_portfolio = try allocator.realloc(portfolio_items.*, portfolio_items.*.len + 1);
+    const new_portfolio = try allocator.realloc(config.portfolio, config.portfolio.len + 1);
     new_portfolio[new_portfolio.len - 1] = new_item;
-    portfolio_items.* = new_portfolio;
+    config.portfolio = new_portfolio;
 
-    state.portfolio = portfolio_items.*;
-    state.message = try std.fmt.allocPrint(allocator, "已添加: {s}", .{sel.name});
+    state.portfolio = config.portfolio;
+    const msg = try std.fmt.allocPrint(allocator, "已添加: {s}", .{sel.name});
+    setMessage(state, allocator, msg);
+
+    // Save immediately
+    pf.save(allocator, config.*) catch {};
 
     // Refresh quotes immediately
     try refreshQuotes(state, allocator);
 }
 
-fn deleteSelected(state: *tui.AppState, allocator: std.mem.Allocator, portfolio_items: *[]pf.Item) !void {
+fn deleteSelected(state: *tui.AppState, allocator: std.mem.Allocator, config: *pf.Config) !void {
     if (state.portfolio.len == 0 or state.selected >= state.portfolio.len) return;
 
     const deleted = state.portfolio[state.selected];
@@ -101,26 +126,30 @@ fn deleteSelected(state: *tui.AppState, allocator: std.mem.Allocator, portfolio_
     allocator.free(deleted.name);
 
     // Remove from array
-    const items = portfolio_items.*;
+    const items = config.portfolio;
     for (state.selected..items.len - 1) |i| {
         items[i] = items[i + 1];
     }
     const new_portfolio = try allocator.realloc(items, items.len - 1);
-    portfolio_items.* = new_portfolio;
+    config.portfolio = new_portfolio;
 
-    state.portfolio = portfolio_items.*;
+    state.portfolio = config.portfolio;
     if (state.selected >= state.portfolio.len and state.portfolio.len > 0) {
         state.selected = state.portfolio.len - 1;
     }
 
-    state.message = try std.fmt.allocPrint(allocator, "已删除: {s}", .{name});
+    const msg = try std.fmt.allocPrint(allocator, "已删除: {s}", .{name});
+    setMessage(state, allocator, msg);
+
+    // Save immediately
+    pf.save(allocator, config.*) catch {};
 
     // Refresh quotes
     try refreshQuotes(state, allocator);
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -134,13 +163,13 @@ pub fn main() !void {
 
     var state = tui.AppState{
         .mode = .normal,
-        .quotes = &.{},
+        .quotes = try allocator.alloc(api.Quote, 0),
         .portfolio = config.portfolio,
         .selected = 0,
-        .search_query = "",
-        .search_results = &.{},
+        .search_query = try allocator.alloc(u8, 0),
+        .search_results = try allocator.alloc(api.SearchResult, 0),
         .search_selected = 0,
-        .message = "",
+        .message = try allocator.alloc(u8, 0),
         .last_update = 0,
         .running = true,
         .need_refresh = true,
@@ -152,15 +181,14 @@ pub fn main() !void {
         allocator.free(state.message);
     }
 
-    var last_refresh: i64 = 0;
+    // Initial data fetch
+    try refreshQuotes(&state, allocator);
+    var last_refresh: i64 = std.time.timestamp();
     var search_dirty = false;
     var search_debounce: u32 = 0;
 
-    // Initial data fetch
-    try refreshQuotes(&state, allocator);
-
     while (state.running) {
-        const event = tui.readEvent() catch tui.Event.none;
+        const event = tui.readEvent(state.mode) catch tui.Event.none;
 
         if (event != .none) {
             switch (state.mode) {
@@ -169,7 +197,7 @@ pub fn main() !void {
                     .add_mode => {
                         state.mode = .search;
                         allocator.free(state.search_query);
-                        state.search_query = "";
+                        state.search_query = try allocator.alloc(u8, 0);
                         search_dirty = false;
                         search_debounce = 0;
                     },
@@ -190,14 +218,14 @@ pub fn main() !void {
                     .cancel => {
                         state.mode = .normal;
                         freeSearchResults(state.search_results, allocator);
-                        state.search_results = &.{};
+                        state.search_results = try allocator.alloc(api.SearchResult, 0);
                         search_dirty = false;
                     },
                     .select => {
-                        try addSelected(&state, allocator, &config.portfolio);
+                        try addSelected(&state, allocator, &config);
                         state.mode = .normal;
                         freeSearchResults(state.search_results, allocator);
-                        state.search_results = &.{};
+                        state.search_results = try allocator.alloc(api.SearchResult, 0);
                         search_dirty = false;
                     },
                     .up => {
@@ -235,12 +263,12 @@ pub fn main() !void {
                 },
                 .confirm_delete => switch (event) {
                     .select => {
-                        try deleteSelected(&state, allocator, &config.portfolio);
+                        try deleteSelected(&state, allocator, &config);
                         state.mode = .normal;
                     },
                     .char => |c| {
                         if (c == 'y' or c == 'Y') {
-                            try deleteSelected(&state, allocator, &config.portfolio);
+                            try deleteSelected(&state, allocator, &config);
                         }
                         state.mode = .normal;
                     },

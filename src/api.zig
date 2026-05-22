@@ -30,7 +30,7 @@ fn fetchWithCurl(allocator: std.mem.Allocator, url: []const u8, max_time: u32) !
     defer allocator.free(max_time_str);
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "curl", "-s", "--max-time", max_time_str, url },
+        .argv = &.{ "curl", "-s", "--connect-timeout", "3", "--max-time", max_time_str, url },
         .max_output_bytes = 10 * 1024 * 1024,
     });
     defer allocator.free(result.stderr);
@@ -117,11 +117,11 @@ pub fn search(allocator: std.mem.Allocator, query: []const u8) ![]SearchResult {
 
     // Format: v_hint="sh~600519~\u8d35\u5dde\u8305\u53f0~gzmt~GP-A^sz~000001~...";
     const prefix = "v_hint=\"";
-    const start = std.mem.indexOf(u8, body, prefix) orelse return &[_]SearchResult{};
+    const start = std.mem.indexOf(u8, body, prefix) orelse return try allocator.alloc(SearchResult, 0);
     const end = std.mem.indexOfPos(u8, body, start + prefix.len, "\";") orelse body.len;
     const content = body[start + prefix.len .. end];
 
-    if (content.len == 0) return &[_]SearchResult{};
+    if (content.len == 0) return try allocator.alloc(SearchResult, 0);
 
     // Count results
     var count: usize = 1;
@@ -203,10 +203,23 @@ fn categorizeItems(allocator: std.mem.Allocator, items: []const PortfolioItem) s
     };
 }
 
+const FetchResult = struct {
+    body: []u8 = &[_]u8{},
+    failed: bool = true,
+};
+
+fn fetchInThread(result: *FetchResult, allocator: std.mem.Allocator, url: []const u8) void {
+    const body = fetchWithCurl(allocator, url, 5) catch {
+        return;
+    };
+    result.body = body;
+    result.failed = false;
+}
+
 /// Fetch quotes for given portfolio items.
 /// Caller owns returned slice. Each quote's strings are individually allocated.
 pub fn fetchQuotes(allocator: std.mem.Allocator, items: []const PortfolioItem) ![]Quote {
-    if (items.len == 0) return &[_]Quote{};
+    if (items.len == 0) return try allocator.alloc(Quote, 0);
 
     const cat = categorizeItems(allocator, items);
     defer allocator.free(cat.em_ids);
@@ -224,105 +237,130 @@ pub fn fetchQuotes(allocator: std.mem.Allocator, items: []const PortfolioItem) !
         quotes.deinit(allocator);
     }
 
-    // Fetch on-market quotes from EastMoney
+    // Build URLs
+    var em_url: ?[]u8 = null;
+    defer if (em_url) |u| allocator.free(u);
     if (cat.em_ids.len > 0) {
-        const url = try std.fmt.allocPrint(
+        em_url = try std.fmt.allocPrint(
             allocator,
             "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f13,f14,f2,f3,f4&secids={s}",
             .{cat.em_ids},
         );
-        defer allocator.free(url);
-
-        var body: []u8 = &[_]u8{};
-        if (fetchWithCurl(allocator, url, 8)) |fetched| {
-            body = fetched;
-        } else |e| {
-            std.log.warn("Failed to fetch on-market quotes: {s}", .{@errorName(e)});
-        }
-        if (body.len > 0) {
-            defer allocator.free(body);
-
-            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-            defer parsed.deinit();
-
-            const data = parsed.value.object.get("data") orelse return error.InvalidResponse;
-            const diff = data.object.get("diff") orelse return error.InvalidResponse;
-            const arr = diff.array;
-
-            for (arr.items) |item| {
-                const obj = item.object;
-                const code = obj.get("f12") orelse continue;
-                const raw_name = obj.get("f14") orelse continue;
-                const price = obj.get("f2") orelse continue;
-                const change_pct = obj.get("f3") orelse continue;
-                const change_amt = obj.get("f4") orelse continue;
-
-                // Find original market from code
-                var market_str: []const u8 = "sh";
-                for (cat.em_items) |orig| {
-                    if (std.mem.eql(u8, orig.code, code.string)) {
-                        market_str = orig.market;
-                        break;
-                    }
-                }
-
-                try quotes.append(allocator, .{
-                    .market = try allocator.dupe(u8, market_str),
-                    .code = try allocator.dupe(u8, code.string),
-                    .name = try allocator.dupe(u8, raw_name.string),
-                    .price = if (price == .float) price.float else if (price == .integer) @floatFromInt(price.integer) else 0,
-                    .change_pct = if (change_pct == .float) change_pct.float else if (change_pct == .integer) @floatFromInt(change_pct.integer) else 0,
-                    .change_amt = if (change_amt == .float) change_amt.float else if (change_amt == .integer) @floatFromInt(change_amt.integer) else 0,
-                });
-            }
-        }
     }
 
-    // Fetch off-market fund quotes from Tiantian Fund
+    var jj_url: ?[]u8 = null;
+    defer if (jj_url) |u| allocator.free(u);
     if (cat.jj_codes.len > 0) {
-        const url = try std.fmt.allocPrint(
+        jj_url = try std.fmt.allocPrint(
             allocator,
             "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?pageIndex=1&pageSize=20&appType=ttjj&product=EFund&plat=Android&deviceid=abc&Version=1&Fcodes={s}",
             .{cat.jj_codes},
         );
-        defer allocator.free(url);
+    }
 
-        var body2: []u8 = &[_]u8{};
-        if (fetchWithCurl(allocator, url, 8)) |fetched| {
-            body2 = fetched;
-        } else |e| {
-            std.log.warn("Failed to fetch fund quotes: {s}", .{@errorName(e)});
-        }
-        if (body2.len > 0) {
-            defer allocator.free(body2);
+    // Parallel fetch using threads
+    var em_result = FetchResult{};
+    var jj_result = FetchResult{};
 
-            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body2, .{});
-            defer parsed.deinit();
+    var em_thread: ?std.Thread = null;
+    var jj_thread: ?std.Thread = null;
 
-            const datas = parsed.value.object.get("Datas") orelse return error.InvalidResponse;
-            const arr = datas.array;
+    if (em_url) |url| {
+        em_thread = std.Thread.spawn(.{}, fetchInThread, .{ &em_result, allocator, url }) catch null;
+    }
+    if (jj_url) |url| {
+        jj_thread = std.Thread.spawn(.{}, fetchInThread, .{ &jj_result, allocator, url }) catch null;
+    }
 
-            for (arr.items) |item| {
-                const obj = item.object;
-                const fcode = obj.get("FCODE") orelse continue;
-                const shortname = obj.get("SHORTNAME") orelse continue;
-                const nav = obj.get("NAV") orelse continue;
-                const navchgrt = obj.get("NAVCHGRT") orelse continue;
+    if (em_thread) |t| {
+        t.join();
+    } else if (em_url) |url| {
+        fetchInThread(&em_result, allocator, url);
+    }
 
-                const nav_f = std.fmt.parseFloat(f64, nav.string) catch 0;
-                const chg_f = std.fmt.parseFloat(f64, navchgrt.string) catch 0;
-                const chg_amt = nav_f * chg_f / 100.0;
+    if (jj_thread) |t| {
+        t.join();
+    } else if (jj_url) |url| {
+        fetchInThread(&jj_result, allocator, url);
+    }
 
-                try quotes.append(allocator, .{
-                    .market = try allocator.dupe(u8, "jj"),
-                    .code = try allocator.dupe(u8, fcode.string),
-                    .name = try allocator.dupe(u8, shortname.string),
-                    .price = nav_f,
-                    .change_pct = chg_f,
-                    .change_amt = chg_amt,
-                });
+    // Parse on-market quotes
+    if (!em_result.failed and em_result.body.len > 0) {
+        defer allocator.free(em_result.body);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, em_result.body, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+
+            const data = p.value.object.get("data");
+            const diff = if (data) |d| d.object.get("diff") else null;
+            if (diff) |df| {
+                for (df.array.items) |item| {
+                    const obj = item.object;
+                    const code = obj.get("f12") orelse continue;
+                    const raw_name = obj.get("f14") orelse continue;
+                    const price = obj.get("f2") orelse continue;
+                    const change_pct = obj.get("f3") orelse continue;
+                    const change_amt = obj.get("f4") orelse continue;
+
+                    // Find original market from code
+                    var market_str: []const u8 = "sh";
+                    for (cat.em_items) |orig| {
+                        if (std.mem.eql(u8, orig.code, code.string)) {
+                            market_str = orig.market;
+                            break;
+                        }
+                    }
+
+                    try quotes.append(allocator, .{
+                        .market = try allocator.dupe(u8, market_str),
+                        .code = try allocator.dupe(u8, code.string),
+                        .name = try allocator.dupe(u8, raw_name.string),
+                        .price = if (price == .float) price.float else if (price == .integer) @floatFromInt(price.integer) else 0,
+                        .change_pct = if (change_pct == .float) change_pct.float else if (change_pct == .integer) @floatFromInt(change_pct.integer) else 0,
+                        .change_amt = if (change_amt == .float) change_amt.float else if (change_amt == .integer) @floatFromInt(change_amt.integer) else 0,
+                    });
+                }
             }
         }
+    } else if (em_result.body.len > 0) {
+        allocator.free(em_result.body);
+    }
+
+    // Parse fund quotes
+    if (!jj_result.failed and jj_result.body.len > 0) {
+        defer allocator.free(jj_result.body);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, jj_result.body, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+
+            const datas = p.value.object.get("Datas");
+            if (datas) |ds| {
+                for (ds.array.items) |item| {
+                    const obj = item.object;
+                    const fcode = obj.get("FCODE") orelse continue;
+                    const shortname = obj.get("SHORTNAME") orelse continue;
+                    const nav = obj.get("NAV") orelse continue;
+                    const navchgrt = obj.get("NAVCHGRT") orelse continue;
+
+                    const nav_f = std.fmt.parseFloat(f64, nav.string) catch 0;
+                    const chg_f = std.fmt.parseFloat(f64, navchgrt.string) catch 0;
+                    const chg_amt = nav_f * chg_f / 100.0;
+
+                    try quotes.append(allocator, .{
+                        .market = try allocator.dupe(u8, "jj"),
+                        .code = try allocator.dupe(u8, fcode.string),
+                        .name = try allocator.dupe(u8, shortname.string),
+                        .price = nav_f,
+                        .change_pct = chg_f,
+                        .change_amt = chg_amt,
+                    });
+                }
+            }
+        }
+    } else if (jj_result.body.len > 0) {
+        allocator.free(jj_result.body);
     }
 
     return quotes.toOwnedSlice(allocator);

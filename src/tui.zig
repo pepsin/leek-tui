@@ -54,13 +54,13 @@ pub fn init() !void {
     raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
     try std.posix.tcsetattr(std.fs.File.stdin().handle, .NOW, raw);
 
-    // Hide cursor, clear screen
-    try writeAll("\x1b[?25l\x1b[2J\x1b[H");
+    // Hide cursor, switch to alternate screen, clear
+    try writeAll("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
 }
 
 pub fn deinit() void {
-    // Show cursor, reset colors
-    writeAll("\x1b[?25h\x1b[0m\x1b[2J\x1b[H") catch {};
+    // Show cursor, reset colors, switch back from alternate screen
+    writeAll("\x1b[?25h\x1b[0m\x1b[?1049l") catch {};
 
     if (original_termios) |term| {
         std.posix.tcsetattr(std.fs.File.stdin().handle, .NOW, term) catch {};
@@ -173,8 +173,8 @@ pub fn render(state: *const AppState) !void {
     const rows = size.rows;
     const cols = size.cols;
 
-    // Clear screen
-    try writeAll("\x1b[2J\x1b[H");
+    // Move cursor to home without clearing (avoid scrollback growth)
+    try writeAll("\x1b[H");
 
     // Title bar
     try setColor(BOLD ++ CYAN);
@@ -183,7 +183,12 @@ pub fn render(state: *const AppState) !void {
     const time_buf = try std.fmt.allocPrint(std.heap.page_allocator, "  更新: {d}", .{state.last_update});
     defer std.heap.page_allocator.free(time_buf);
     try stdout_writer.writeAll(time_buf);
+    try writeAll("\x1b[K"); // clear to end of line
     try setColor(RESET);
+
+    // Empty line 2
+    try moveCursor(2, 1);
+    try writeAll("\x1b[K");
 
     // Header line
     try moveCursor(3, 1);
@@ -193,6 +198,7 @@ pub fn render(state: *const AppState) !void {
     try writePadded("现价", 12);
     try writePadded("涨跌幅", 12);
     try writePadded("涨跌额", 12);
+    try writeAll("\x1b[K");
     try writeAll(RESET);
 
     // Separator
@@ -214,47 +220,79 @@ pub fn render(state: *const AppState) !void {
     const list_start_row = 5;
     const max_list_rows = rows - 8;
 
-    if (state.quotes.len == 0) {
+    if (state.portfolio.len == 0) {
         try moveCursor(list_start_row, 3);
         try setColor(DIM);
         try writeAll("暂无关注股票/基金，按 a 添加");
+        try writeAll("\x1b[K");
         try writeAll(RESET);
+        // Clear remaining rows
+        var clear_row: u16 = list_start_row + 1;
+        while (clear_row < rows -| 3) : (clear_row += 1) {
+            try moveCursor(clear_row, 1);
+            try writeAll("\x1b[K");
+        }
     } else {
         const start_idx = if (state.selected >= max_list_rows) state.selected - max_list_rows + 1 else 0;
-        const end_idx = @min(start_idx + max_list_rows, state.quotes.len);
+        const end_idx = @min(start_idx + max_list_rows, state.portfolio.len);
 
         var row: u16 = list_start_row;
         var i = start_idx;
         while (i < end_idx) : (i += 1) {
-            const q = state.quotes[i];
+            const item = state.portfolio[i];
             try moveCursor(@intCast(row), 1);
 
             if (i == state.selected and state.mode == .normal) {
                 try setColor(REVERSE);
             }
 
-            var price_buf: [32]u8 = undefined;
-            var pct_buf: [32]u8 = undefined;
-            var amt_buf: [32]u8 = undefined;
+            // Find matching quote
+            var quote: ?api.Quote = null;
+            for (state.quotes) |q| {
+                if (std.mem.eql(u8, q.code, item.code) and std.mem.eql(u8, q.market, item.market)) {
+                    quote = q;
+                    break;
+                }
+            }
 
-            // Color based on change
-            const color = if (q.change_pct > 0) RED else if (q.change_pct < 0) GREEN else "";
-
-            try writePadded(q.name, 16);
+            try writePadded(item.name, 16);
             try setColor(DIM);
-            try writePadded(q.code, 12);
+            try writePadded(item.code, 12);
             try setColor(RESET);
 
-            if (i == state.selected and state.mode == .normal) {
-                try setColor(REVERSE);
+            if (quote) |q| {
+                if (i == state.selected and state.mode == .normal) {
+                    try setColor(REVERSE);
+                }
+
+                var price_buf: [32]u8 = undefined;
+                var pct_buf: [32]u8 = undefined;
+                var amt_buf: [32]u8 = undefined;
+
+                const color = if (q.change_pct > 0) RED else if (q.change_pct < 0) GREEN else "";
+                try setColor(color);
+                try writePadded(fmtPrice(&price_buf, q.price), 12);
+                try writePadded(fmtChangePct(&pct_buf, q.change_pct), 12);
+                try writePadded(fmtChangeAmt(&amt_buf, q.change_amt), 12);
+            } else {
+                if (i == state.selected and state.mode == .normal) {
+                    try setColor(REVERSE);
+                }
+                try setColor(DIM);
+                try writePadded("--", 12);
+                try writePadded("--", 12);
+                try writePadded("--", 12);
             }
-            try setColor(color);
-            try writePadded(fmtPrice(&price_buf, q.price), 12);
-            try writePadded(fmtChangePct(&pct_buf, q.change_pct), 12);
-            try writePadded(fmtChangeAmt(&amt_buf, q.change_amt), 12);
+            try writeAll("\x1b[K");
             try setColor(RESET);
 
             row += 1;
+        }
+
+        // Clear remaining rows below the list
+        while (row < rows -| 3) : (row += 1) {
+            try moveCursor(row, 1);
+            try writeAll("\x1b[K");
         }
     }
 
@@ -380,17 +418,20 @@ pub fn render(state: *const AppState) !void {
     try writeAll(RESET);
 
     // Message line
-    if (state.message.len > 0 and rows >= 2) {
+    if (rows >= 2) {
         try moveCursor(rows -| 2, 1);
-        try setColor(YELLOW);
-        try stdout_writer.writeAll(state.message);
-        try writeAll(RESET);
+        if (state.message.len > 0) {
+            try setColor(YELLOW);
+            try stdout_writer.writeAll(state.message);
+            try setColor(RESET);
+        }
+        try writeAll("\x1b[K");
     }
 
     // flush not needed for stdout
 }
 
-pub fn readEvent() !Event {
+pub fn readEvent(mode: Mode) !Event {
     const stdin = std.fs.File.stdin().handle;
 
     var c: u8 = undefined;
@@ -414,7 +455,16 @@ pub fn readEvent() !Event {
         return Event.cancel; // ESC
     }
 
-    // Single characters
+    // In search mode, most keys are text input
+    if (mode == .search) {
+        switch (c) {
+            '\r', '\n' => return Event.select,
+            '\x7f', '\x08' => return Event.backspace,
+            else => return Event{ .char = c },
+        }
+    }
+
+    // Normal/confirm_delete mode
     switch (c) {
         'q', 'Q' => return Event.quit,
         'a', 'A' => return Event.add_mode,
@@ -422,7 +472,7 @@ pub fn readEvent() !Event {
         'j', 'J' => return Event.down,
         'k', 'K' => return Event.up,
         '\r', '\n' => return Event.select,
-        '\x7f', '\x08' => return Event.backspace, // backspace / del
+        '\x7f', '\x08' => return Event.backspace,
         else => return Event{ .char = c },
     }
 }
