@@ -87,7 +87,55 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
+    const test_search_exe = b.addExecutable(.{
+        .name = "test_search",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_search.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "leek_tui", .module = mod },
+            },
+        }),
+    });
+    const run_test_search = b.addRunArtifact(test_search_exe);
+    const test_search_step = b.step("test-search", "Run search test");
+    test_search_step.dependOn(&run_test_search.step);
+
+    const test_quotes_exe = b.addExecutable(.{
+        .name = "test_quotes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_quotes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "leek_tui", .module = mod },
+            },
+        }),
+    });
+    const run_test_quotes = b.addRunArtifact(test_quotes_exe);
+    const test_quotes_step = b.step("test-quotes", "Run quotes test");
+    test_quotes_step.dependOn(&run_test_quotes.step);
+
+    const test_portfolio_exe = b.addExecutable(.{
+        .name = "test_portfolio",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_portfolio.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "leek_tui", .module = mod },
+            },
+        }),
+    });
+    const run_test_portfolio = b.addRunArtifact(test_portfolio_exe);
+    const test_portfolio_step = b.step("test-portfolio", "Run portfolio test");
+    test_portfolio_step.dependOn(&run_test_portfolio.step);
+
     b.installArtifact(exe);
+    b.installArtifact(test_search_exe);
+    b.installArtifact(test_quotes_exe);
+    b.installArtifact(test_portfolio_exe);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).

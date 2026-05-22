@@ -26,9 +26,11 @@ pub const Quote = struct {
 
 /// Call curl to fetch URL and return response body as owned string.
 fn fetchWithCurl(allocator: std.mem.Allocator, url: []const u8, max_time: u32) ![]u8 {
+    const max_time_str = try std.fmt.allocPrint(allocator, "{d}", .{max_time});
+    defer allocator.free(max_time_str);
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "curl", "-s", "--max-time", try std.fmt.allocPrint(allocator, "{d}", .{max_time}), url },
+        .argv = &.{ "curl", "-s", "--max-time", max_time_str, url },
         .max_output_bytes = 10 * 1024 * 1024,
     });
     defer allocator.free(result.stderr);
